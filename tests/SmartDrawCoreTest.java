@@ -16,8 +16,10 @@ import org.openstreetmap.josm.data.osm.Way;
 import org.openstreetmap.josm.plugins.smartdraw.FollowPath;
 import org.openstreetmap.josm.plugins.smartdraw.BuildingDetector;
 import org.openstreetmap.josm.plugins.smartdraw.BuildingGeometry;
+import org.openstreetmap.josm.plugins.smartdraw.FastDrawSimplifier;
 import org.openstreetmap.josm.plugins.smartdraw.Geometry;
 import org.openstreetmap.josm.plugins.smartdraw.MagneticTracer;
+import org.openstreetmap.josm.plugins.smartdraw.SimplificationStats;
 import org.openstreetmap.josm.plugins.smartdraw.TagRules;
 import org.openstreetmap.josm.plugins.PluginInformation;
 import org.openstreetmap.josm.spi.preferences.Config;
@@ -55,6 +57,23 @@ public final class SmartDrawCoreTest {
         List<Point2D> points = List.of(new Point2D.Double(0, 0), new Point2D.Double(1, 0.1),
                 new Point2D.Double(2, 0), new Point2D.Double(3, 1));
         check(Geometry.simplify(points, 0.2).size() == 3, "simplification keeps bend");
+        List<Point> fastDrawPoints = List.of(new Point(0, 0), new Point(10, 3),
+                new Point(20, 0), new Point(30, 0));
+        check(FastDrawSimplifier.keptIndices(fastDrawPoints,
+                List.of(false, false, false, false), 2).equals(List.of(0, 1, 3)),
+                "FastDraw epsilon keeps a meaningful screen-pixel bend");
+        check(FastDrawSimplifier.keptIndices(fastDrawPoints,
+                List.of(false, false, true, false), 4).equals(List.of(0, 2, 3)),
+                "fixed shared nodes split simplification fragments");
+        check(FastDrawSimplifier.keptIndices(List.of(new Point(0, 0), new Point(15, 1), new Point(10, 0)),
+                List.of(false, false, false), 2).equals(List.of(0, 2)),
+                "FastDraw simplification measures distance to the infinite line");
+        check(SimplificationStats.maxPointsPerKm(List.of(new LatLon(0, 0),
+                new LatLon(0, 0.001), new LatLon(0, 0.002)), 10) >= 8,
+                "points per kilometre uses geographic distance");
+        check(SimplificationStats.maxPointsPerKm(List.of(new LatLon(0, 0),
+                new LatLon(0, 0.001), new LatLon(0, 0.00101), new LatLon(0, 0.00102)), 2) > 800,
+                "sliding density window detects a locally dense segment");
         List<Point2D> noisy = List.of(new Point2D.Double(0, 0), new Point2D.Double(1, 3),
                 new Point2D.Double(2, -3), new Point2D.Double(3, 3),
                 new Point2D.Double(4, -3), new Point2D.Double(5, 0));

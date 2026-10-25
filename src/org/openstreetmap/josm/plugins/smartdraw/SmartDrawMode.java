@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -79,6 +80,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private final List<TracePoint> draft = new ArrayList<>();
     private final List<TracePoint> followPreview = new ArrayList<>();
     private final List<TracePoint> magneticPreview = new ArrayList<>();
+    private List<TracePoint> simplificationPreview = List.of();
+    private List<TracePoint> displayedPreview = List.of();
     private final Map<Way, List<Candidate>> pending = new HashMap<>();
     private final AtomicInteger magneticEpoch = new AtomicInteger();
     private DrawKind kind = DrawKind.WAY;
@@ -102,7 +105,13 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private boolean forward = true;
     private int snapPixels = 14;
     private int densityPixels = 6;
-    private double simplifyPixels = 2.5;
+    private double simplifyPixels = 5;
+    private double previewEpsilon;
+    private double epsilonMultiplier = 1.1;
+    private double maxPointsPerKm = 150;
+    private int densityWindow = 10;
+    private boolean autoSimplify = true;
+    private boolean previewReady;
     private double magneticSensitivity = 12;
     private int magneticRadius = 18;
     private final Shortcut reverseShortcut;
@@ -115,7 +124,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         shiftListener = event -> {
             if (event.getKeyCode() == KeyEvent.VK_SHIFT) {
                 shiftHeld = event.getID() == KeyEvent.KEY_PRESSED;
-                if (!shiftHeld && !magneticEnabled) {
+                if (!shiftHeld && !magneticEnabled && !previewReady) {
                     magneticEpoch.incrementAndGet();
                     magneticPreview.clear();
                     if (magneticTimer != null) magneticTimer.stop();
@@ -138,7 +147,11 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         overlapWarning = pref.getBoolean("smartdraw.overlapWarning", true);
         snapPixels = pref.getInt("smartdraw.snapPixels", 14);
         densityPixels = pref.getInt("smartdraw.densityPixels", 6);
-        simplifyPixels = pref.getDouble("smartdraw.simplifyPixels", 2.5);
+        simplifyPixels = pref.getDouble("smartdraw.simplifyPixels", 5);
+        epsilonMultiplier = Math.max(1.01, pref.getDouble("smartdraw.epsilonMultiplier", 1.1));
+        maxPointsPerKm = Math.max(1, pref.getDouble("smartdraw.maxPointsPerKm", 150));
+        densityWindow = Math.max(2, pref.getInt("smartdraw.densityWindow", 10));
+        autoSimplify = pref.getBoolean("smartdraw.autoSimplify", true);
         rules.configure(pref.get("smartdraw.includes", rules.includes()),
                 pref.get("smartdraw.excludes", rules.excludes()),
                 pref.getBoolean("smartdraw.unrestricted", false));
@@ -162,9 +175,12 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         });
         magneticTimer = new Timer(100, event -> calculateMagnetic());
         magneticTimer.setRepeats(false);
-        bind(view, "ENTER", "smartdraw.finish", this::finish);
+        bind(view, "ENTER", "smartdraw.finish", this::enterOrFinish);
         bind(view, "ESCAPE", "smartdraw.cancel", this::cancel);
         bind(view, "BACK_SPACE", "smartdraw.back", this::back);
+        bind(view, "UP", "smartdraw.more-detail", () -> adjustSimplification(false));
+        bind(view, "DOWN", "smartdraw.less-detail", () -> adjustSimplification(true));
+        bind(view, "Q", "smartdraw.options", this::options);
         bind(view, reverseShortcut.getKeyStroke(), "smartdraw.reverse", () -> { forward = !forward; refreshFollow(); });
     }
 
@@ -189,7 +205,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         view.removeMouseListener(this);
         view.removeMouseMotionListener(this);
         view.removeTemporaryLayer(this);
-        for (String action : new String[] {"finish", "cancel", "back", "reverse"}) {
+        for (String action : new String[] {"finish", "cancel", "back", "reverse",
+                "more-detail", "less-detail", "options"}) {
             view.getActionMap().remove("smartdraw." + action);
         }
         super.exitMode();
@@ -197,11 +214,12 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
 
     @Override public String getModeHelpText() {
         return "Drag/click: draw | Building: double-click roof | Alt-click: follow | " + reverseShortcut.getKeyText()
-                + ": reverse | Enter: finish | Backspace: undo point | use top bar for options";
+                + ": reverse | Enter: simplify/save | Up/Down: detail | Q: options | Backspace: edit";
     }
 
     @Override public void mousePressed(MouseEvent e) {
         if (e.getButton() != MouseEvent.BUTTON1 || layer() == null) return;
+        if (previewReady) invalidateSimplificationPreview();
         frame.mapView.requestFocusInWindow();
         if (kind == DrawKind.BUILDING && e.getClickCount() >= 2 && draft.size() <= 1) {
             proposeBuilding(e.getPoint());
@@ -220,6 +238,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             if (followStart == null || followStart.way != hovered.way) {
                 if (followStart != null && !draft.isEmpty() && draft.get(draft.size() - 1).node == followStart.node) {
                     draft.remove(draft.size() - 1);
+                    invalidateSimplificationPreview();
                 }
                 followStart = hovered.materialize();
                 if (draft.isEmpty() || !same(draft.get(draft.size() - 1), followStart.node)) {
@@ -243,7 +262,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         magneticEpoch.incrementAndGet();
         magneticPreview.clear();
         if (magneticTimer != null) magneticTimer.stop();
-        if (magneticActive(e)) {
+        if (magneticActive(e) && !e.isControlDown()) {
             dragImagery = captureDragImagery();
             if (!acceptMagnetic(e)) appendMagneticAt(e);
         } else {
@@ -260,7 +279,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             add(new TracePoint(frame.mapView.getLatLon(press.x, press.y), FREE, false));
         }
         cursor = e.getPoint();
-        if (magneticActive(e)) {
+        if (magneticActive(e) && !e.isControlDown()) {
             if (dragImagery == null) dragImagery = captureDragImagery();
             appendMagneticAt(e);
         }
@@ -273,12 +292,13 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             dragging = false;
             return;
         }
-        if (dragging && magneticActive(e)) appendMagneticAt(e);
+        if (dragging && magneticActive(e) && !e.isControlDown()) appendMagneticAt(e);
         dragImagery = null;
         dragging = false;
     }
 
     @Override public void mouseMoved(MouseEvent e) {
+        if (previewReady) return;
         cursor = e.getPoint();
         updateCandidate(e);
         refreshFollow();
@@ -292,8 +312,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
 
     private String idleStatus() {
         if (kind == DrawKind.BUILDING) return "Double-click a roof to propose a building outline";
-        if (kind == DrawKind.AREA) return "Draw an area; Enter closes it automatically";
-        return "Click a point to start drawing";
+        if (kind == DrawKind.AREA) return "Draw an area; Enter previews simplification, Enter again saves";
+        return "Draw a way; Enter previews simplification, Enter again saves";
     }
 
     private ImageryLayer visibleImagery() {
@@ -514,13 +534,14 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         if (hovered != null && hovered.segment < 0 && smartSnap && !e.isControlDown()) {
             next = new TracePoint(hovered.node, FREE, true);
         } else {
-            next = new TracePoint(frame.mapView.getLatLon(e.getX(), e.getY()), FREE, false);
+            next = new TracePoint(frame.mapView.getLatLon(e.getX(), e.getY()), FREE, e.isControlDown());
         }
         if (!draft.isEmpty()) {
             TracePoint last = draft.get(draft.size() - 1);
             if (same(last, next.node)) return;
             Point2D a = frame.mapView.getPoint2D(last.location());
             if (draft.size() >= 3 && frame.mapView.getPoint2D(draft.get(0).location()).distance(e.getPoint()) < snapPixels) {
+                invalidateSimplificationPreview();
                 close = true;
                 frame.mapView.repaint();
                 return;
@@ -533,6 +554,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private boolean same(TracePoint point, Node node) { return node != null && point.node == node; }
 
     private void add(TracePoint point) {
+        invalidateSimplificationPreview();
         if (draft.isEmpty() || draft.get(draft.size() - 1).node != point.node || point.node == null) draft.add(point);
         close = false;
         buildingProposal = false;
@@ -622,6 +644,12 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     }
 
     private void back() {
+        if (previewReady) {
+            invalidateSimplificationPreview();
+            setMagneticStatus("Simplification preview closed; edit the draft or press Enter again");
+            frame.mapView.repaint();
+            return;
+        }
         if (followStart != null) {
             if (!draft.isEmpty() && draft.get(draft.size() - 1).node == followStart.node) draft.remove(draft.size() - 1);
             followStart = null; followPreview.clear();
@@ -633,6 +661,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     }
 
     private void cancel() {
+        invalidateSimplificationPreview();
         draft.clear(); followPreview.clear(); magneticPreview.clear(); pending.clear(); followStart = null; close = false;
         buildingProposal = false;
         pendingBuildingPress = null;
@@ -643,11 +672,94 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         frame.mapView.repaint();
     }
 
+    private void invalidateSimplificationPreview() {
+        previewReady = false;
+        simplificationPreview = List.of();
+        displayedPreview = List.of();
+    }
+
+    private void enterOrFinish() {
+        if (kind != DrawKind.BUILDING && !previewReady) {
+            if (draft.size() >= 2 && followStart == null) prepareSimplificationPreview();
+            return;
+        }
+        finish();
+    }
+
+    private void prepareSimplificationPreview() {
+        magneticEpoch.incrementAndGet();
+        magneticPreview.clear();
+        if (magneticTimer != null) magneticTimer.stop();
+        previewEpsilon = Math.max(0.001, simplifyPixels);
+        refreshSimplificationPreview();
+        int protectedNodes = Math.min(2, draft.size());
+        for (int i = 1; i + 1 < draft.size(); i++) if (draft.get(i).fixed) protectedNodes++;
+        if (autoSimplify) {
+            for (int attempt = 0; attempt < 80
+                    && previewEpsilon < 1000
+                    && simplificationPreview.size() > protectedNodes
+                    && pointsPerKm(simplificationPreview) > maxPointsPerKm; attempt++) {
+                previewEpsilon *= epsilonMultiplier;
+                refreshSimplificationPreview();
+            }
+        }
+        refreshDisplayedPreview();
+        previewReady = true;
+        showSimplificationStatus();
+        frame.mapView.repaint();
+    }
+
+    private void refreshSimplificationPreview() {
+        simplificationPreview = simplified(previewEpsilon);
+    }
+
+    private void refreshDisplayedPreview() {
+        displayedPreview = simplificationPreview;
+        if (kind == DrawKind.AREA && layer() != null) {
+            Map<Way, List<Candidate>> previewInsertions = new HashMap<>();
+            for (Map.Entry<Way, List<Candidate>> entry : pending.entrySet())
+                previewInsertions.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+            displayedPreview = closeAlongExistingWay(
+                    attachAreaEndpoints(simplificationPreview, previewInsertions), previewInsertions);
+        }
+    }
+
+    private double pointsPerKm(List<TracePoint> points) {
+        List<LatLon> coordinates = new ArrayList<>();
+        for (TracePoint point : points) coordinates.add(point.location());
+        return SimplificationStats.maxPointsPerKm(coordinates, densityWindow);
+    }
+
+    private void showSimplificationStatus() {
+        setMagneticStatus(String.format(Locale.ROOT,
+                "Eps %.2f px | %d nodes | %.0f p/km | Up: more, Down: fewer, Enter: save, Backspace: edit",
+                previewEpsilon, displayedPreview.size(), pointsPerKm(displayedPreview)));
+    }
+
+    private void adjustSimplification(boolean fewerNodes) {
+        if (!previewReady) {
+            int previous = densityPixels;
+            densityPixels = fewerNodes ? (int) Math.ceil(densityPixels * epsilonMultiplier)
+                    : (int) Math.floor(densityPixels / epsilonMultiplier);
+            if (densityPixels == previous) densityPixels += fewerNodes ? 1 : -1;
+            densityPixels = Math.max(2, Math.min(80, densityPixels));
+            Config.getPref().putInt("smartdraw.densityPixels", densityPixels);
+            setMagneticStatus("Minimum point spacing: " + densityPixels + " px | Up: more, Down: fewer");
+            return;
+        }
+        previewEpsilon = Math.max(0.001, Math.min(1000,
+                fewerNodes ? previewEpsilon * epsilonMultiplier : previewEpsilon / epsilonMultiplier));
+        refreshSimplificationPreview();
+        refreshDisplayedPreview();
+        showSimplificationStatus();
+        frame.mapView.repaint();
+    }
+
     private void finish() {
         OsmDataLayer layer = layer();
         if (layer == null || draft.size() < 2 || followStart != null) return;
         boolean closed = kind != DrawKind.WAY || close;
-        List<TracePoint> result = simplified();
+        List<TracePoint> result = previewReady ? new ArrayList<>(simplificationPreview) : simplified(simplifyPixels);
         Map<Way, List<Candidate>> finishPending = new HashMap<>();
         for (Map.Entry<Way, List<Candidate>> entry : pending.entrySet())
             finishPending.put(entry.getKey(), new ArrayList<>(entry.getValue()));
@@ -713,24 +825,15 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         cancel();
     }
 
-    private List<TracePoint> simplified() {
-        List<TracePoint> output = new ArrayList<>();
-        int index = 0;
-        while (index < draft.size()) {
-            int end = index + 1;
-            while (end < draft.size() && !draft.get(end - 1).fixed && !draft.get(end).fixed) end++;
-            if (end - index > 2) {
-                List<Point2D> screen = new ArrayList<>();
-                for (int i = index; i < end; i++) screen.add(frame.mapView.getPoint2D(draft.get(i).location()));
-                List<Point2D> kept = Geometry.simplify(screen, simplifyPixels);
-                for (int i = index; i < end; i++) {
-                    if (kept.contains(screen.get(i)) && (output.isEmpty() || output.get(output.size() - 1) != draft.get(i))) output.add(draft.get(i));
-                }
-            } else {
-                for (int i = index; i < end; i++) if (output.isEmpty() || output.get(output.size() - 1) != draft.get(i)) output.add(draft.get(i));
-            }
-            index = Math.max(index + 1, end - 1);
+    private List<TracePoint> simplified(double epsilon) {
+        List<Point> screen = new ArrayList<>(draft.size());
+        List<Boolean> fixed = new ArrayList<>(draft.size());
+        for (TracePoint point : draft) {
+            screen.add(frame.mapView.getPoint(point.location()));
+            fixed.add(point.fixed);
         }
+        List<TracePoint> output = new ArrayList<>();
+        for (int index : FastDrawSimplifier.keptIndices(screen, fixed, epsilon)) output.add(draft.get(index));
         return output;
     }
 
@@ -876,6 +979,14 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         Graphics2D g = (Graphics2D) graphics.create();
         try {
             g.setStroke(new BasicStroke(3, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            if (previewReady) {
+                for (int i = 1; i < displayedPreview.size(); i++)
+                    draw(g, view, displayedPreview.get(i - 1), displayedPreview.get(i), MAGNETIC);
+                if ((kind == DrawKind.AREA || close) && displayedPreview.size() > 2)
+                    draw(g, view, displayedPreview.get(displayedPreview.size() - 1),
+                            displayedPreview.get(0), MAGNETIC);
+                return;
+            }
             for (int i = 1; i < draft.size(); i++) draw(g, view, draft.get(i - 1), draft.get(i), draft.get(i).color);
             for (int i = 1; i < followPreview.size(); i++) draw(g, view, followPreview.get(i - 1), followPreview.get(i), FOLLOW);
             for (int i = 1; i < magneticPreview.size(); i++) draw(g, view, magneticPreview.get(i - 1), magneticPreview.get(i), MAGNETIC);
@@ -905,20 +1016,28 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         JCheckBox magnetic = new JCheckBox("Magnetic imagery preview", magneticEnabled);
         JCheckBox overlaps = new JCheckBox("Warn about area overlaps", overlapWarning);
         JCheckBox unrestricted = new JCheckBox("Unrestricted targets (exclusions still apply)", rules.unrestricted());
+        JCheckBox autosimplify = new JCheckBox("Auto-simplify to maximum points per km", autoSimplify);
         JTextField includes = new JTextField(rules.includes());
         JTextField excludes = new JTextField(rules.excludes());
         JSpinner snap = new JSpinner(new SpinnerNumberModel(snapPixels, 2, 80, 1));
         JSpinner density = new JSpinner(new SpinnerNumberModel(densityPixels, 2, 80, 1));
-        JSpinner simplify = new JSpinner(new SpinnerNumberModel(simplifyPixels, 0.0, 20.0, 0.5));
+        JSpinner simplify = new JSpinner(new SpinnerNumberModel(simplifyPixels, 0.001, 1000.0, 0.5));
+        JSpinner multiplier = new JSpinner(new SpinnerNumberModel(epsilonMultiplier, 1.01, 3.0, 0.01));
+        JSpinner maxPkm = new JSpinner(new SpinnerNumberModel(maxPointsPerKm, 1.0, 5000.0, 10.0));
+        JSpinner pkmWindow = new JSpinner(new SpinnerNumberModel(densityWindow, 2, 100, 1));
         JSpinner sensitivity = new JSpinner(new SpinnerNumberModel(magneticSensitivity, 0.0, 20.0, 0.5));
         JSpinner radius = new JSpinner(new SpinnerNumberModel(magneticRadius, 4, 40, 1));
         JPanel panel = new JPanel(new GridLayout(0, 1));
-        panel.add(snapping); panel.add(following); panel.add(magnetic); panel.add(overlaps); panel.add(unrestricted);
+        panel.add(snapping); panel.add(following); panel.add(magnetic); panel.add(overlaps);
+        panel.add(unrestricted); panel.add(autosimplify);
         panel.add(new JLabel("Magnetic sensitivity")); panel.add(sensitivity);
         panel.add(new JLabel("Magnetic attraction radius (pixels)")); panel.add(radius);
         panel.add(new JLabel("Snap radius (screen pixels)")); panel.add(snap);
         panel.add(new JLabel("Minimum node spacing (screen pixels)")); panel.add(density);
-        panel.add(new JLabel("Simplification tolerance (screen pixels)")); panel.add(simplify);
+        panel.add(new JLabel("Starting simplification epsilon (screen pixels)")); panel.add(simplify);
+        panel.add(new JLabel("Up/Down epsilon multiplier")); panel.add(multiplier);
+        panel.add(new JLabel("Maximum points per km")); panel.add(maxPkm);
+        panel.add(new JLabel("Points-per-km window (segments)")); panel.add(pkmWindow);
         panel.add(new JLabel("Included tags, comma separated")); panel.add(includes);
         panel.add(new JLabel("Excluded tags, comma separated")); panel.add(excludes);
         if (JOptionPane.showConfirmDialog(frame, panel, "SmartDraw options", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
@@ -927,6 +1046,10 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             rules.configure(includes.getText(), excludes.getText(), unrestricted.isSelected());
             snapPixels = (Integer) snap.getValue(); densityPixels = (Integer) density.getValue();
             simplifyPixels = (Double) simplify.getValue();
+            epsilonMultiplier = (Double) multiplier.getValue();
+            maxPointsPerKm = (Double) maxPkm.getValue();
+            densityWindow = (Integer) pkmWindow.getValue();
+            autoSimplify = autosimplify.isSelected();
             var pref = Config.getPref();
             pref.putBoolean("smartdraw.snap", smartSnap);
             pref.putBoolean("smartdraw.follow", followEnabled);
@@ -938,9 +1061,15 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             pref.putInt("smartdraw.snapPixels", snapPixels);
             pref.putInt("smartdraw.densityPixels", densityPixels);
             pref.putDouble("smartdraw.simplifyPixels", simplifyPixels);
+            pref.putDouble("smartdraw.epsilonMultiplier", epsilonMultiplier);
+            pref.putDouble("smartdraw.maxPointsPerKm", maxPointsPerKm);
+            pref.putInt("smartdraw.densityWindow", densityWindow);
+            pref.putBoolean("smartdraw.autoSimplify", autoSimplify);
             pref.put("smartdraw.includes", rules.includes());
             pref.put("smartdraw.excludes", rules.excludes());
             controls.magnetic.setSelected(magneticEnabled);
+            if (previewReady) prepareSimplificationPreview();
+            frame.mapView.requestFocusInWindow();
         }
     }
 
@@ -979,8 +1108,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
                 Config.getPref().put("smartdraw.kind", selected.name());
                 setMagneticStatus(selected == DrawKind.BUILDING
                         ? "Double-click a roof to propose a building outline"
-                        : selected == DrawKind.AREA ? "Area closes automatically when you press Enter"
-                        : "Way remains open when you press Enter");
+                        : selected == DrawKind.AREA ? "Area closes after the simplification preview is saved"
+                        : "Way remains open after the simplification preview is saved");
                 frame.mapView.requestFocusInWindow();
             });
             add(kind);
