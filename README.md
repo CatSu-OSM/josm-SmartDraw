@@ -1,0 +1,29 @@
+# SmartDraw for JOSM
+
+An experimental drawing mode for manually tracing OSM ways. It currently implements freehand input, optional imagery-edge snapping while dragging, exact node reuse, configurable tag-filtered snapping, and explicit traversal of existing way geometry. Segment entry and exit insert shared nodes into the existing way through JOSM's undo stack.
+
+## Build and install
+
+Run `./build.ps1` in PowerShell. Pass `-JosmJar C:\path\to\josm.jar` if JOSM is installed elsewhere. Copy `dist/smartdraw.jar` to `%APPDATA%\JOSM\plugins\`, then enable **SmartDraw** in JOSM plugin preferences and restart JOSM if needed. Requires a JOSM build compatible with the installed jar and Java 17 or later.
+
+After updating an already installed copy, restart JOSM when convenient so its class loader picks up the new JAR. Keep any unsaved map work in mind before restarting.
+
+## Use
+
+Select SmartDraw from the **Mode** menu or map-mode toolbar with an editable OSM data layer open. Its assigned shortcut is shown in the Mode menu; JOSM may assign a different key if the default is already used. A small SmartDraw bar appears above the map with a **Way / Area / Building** selector, **Magnetic**, **Options...**, and **Reverse follow** controls.
+
+- Click to add a point; drag to trace continuously. Click near an eligible existing node to reuse it.
+- Select **Way** for an open line or **Area** for an automatically closed polygon. Press **Enter** to finish; Area connects the last point to the first only when finished, without showing a provisional closing segment while you draw. If both ends are near the same eligible existing boundary, Area attaches them and closes along that boundary, reusing its OSM nodes. The new area remains a separate way sharing the common edge.
+- Select **Building** and double-click a roof in the imagery to propose a footprint. A single click leaves no point. Detection runs in the background and the orange outline appears when ready. Inspect it, then press **Enter** to create a closed `building=yes` way or **Escape** to discard it. For manual tracing, start with a drag or **Ctrl-click** to place the first point. Simple roofs use a fitted rectangle; roofs with multiple sections use a simplified polygon even if a central rectangle also fits. The polygon pass removes small rooftop notches, fits straight wall directions, and places corners where those lines meet. Clear non-square building angles are kept. Use manual tracing when it reports no clear roof.
+- Alt-click a node or segment on an eligible way to start following it. Move the cursor along that way to preview the path and Alt-click the endpoint to accept it. Use **Reverse follow** to reverse traversal around a closed polygon.
+- Check **Magnetic** in the SmartDraw bar, or hold **Shift** temporarily. Click and drag along an imagery boundary; SmartDraw draws an orange line snapped to the visible edge as you move. If there is no continuous edge near the pointer, it leaves a gap instead of drawing across the area. Hovering after an anchor can also show an orange path preview, which you may click to accept.
+- Press **Enter** to commit a way with JOSM's undo/redo command stack. **Backspace** removes the last draft point; **Escape** cancels. Use **Options...** in the SmartDraw bar for settings. Hold **Ctrl** to disable snapping temporarily.
+- To close a polygon, trace back to its first point. The newly created way is selected for tagging through JOSM's normal properties panel.
+
+## Current limitations
+
+Hover preview and drag tracing allow a span of at least half the visible map width. Drag snapping uses the currently rendered imagery and searches within at least 32 pixels of the cursor. It detects color changes as well as brightness changes. The path search widens for longer spans so it can follow a curved boundary; it still requires a continuous edge, so a span across missing or unclear imagery is left unconnected. Dragged spans are smoothed and stop before crossing an earlier part of the draft. Building detection combines roof color, texture, and straight-edge measurements, then proposes a rectangle or simplified roof polygon. It removes small zigzags, squares corners already close to 90 degrees, preserves clear oblique angles, and estimates short occluded corners from neighboring edges. The proposal may still be inaccurate on complex roofs or heavy tree cover. Automatic boundary-follow suggestions and user tagging presets are not implemented; following requires an explicit Alt-click. Area overlap warnings cover closed ways, not multipolygon relation interiors. The tool does not perform JOSM's full topology validation. JOSM can reassign the mode and reverse shortcuts; use the Mode menu and SmartDraw bar to see reliable controls. Simplification only affects new freehand segments and is based on the current screen zoom. Review geometry with JOSM Validator before upload.
+
+Run `./test.ps1` for geometry, tag filtering, magnetic crop, path traversal, undo/redo, and JAR manifest checks. These tests do not exercise live mouse interaction, imagery providers, or a running JOSM UI.
+
+The project uses JOSM's public plugin API and does not copy FastDraw source or bundle FastDraw. SmartDraw is licensed under GPL-2.0-or-later; see `COPYING`.

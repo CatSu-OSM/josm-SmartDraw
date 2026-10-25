@@ -1,0 +1,9 @@
+Manifest-Version: 1.0
+Plugin-Class: org.openstreetmap.josm.plugins.smartdraw.SmartDrawPlugin
+Plugin-Description: Smart tracing for ways, areas, and buildings
+Plugin-Version: 2.0.6
+Plugin-Canloadatruntime: true
+Plugin-Mainversion: 19613
+Plugin-Minimum-Java-Version: 17
+Author: SmartDraw contributors
+
