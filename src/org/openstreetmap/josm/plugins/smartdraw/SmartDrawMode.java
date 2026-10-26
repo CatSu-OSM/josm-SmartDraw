@@ -245,6 +245,12 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         }
         cursor = e.getPoint();
         updateCandidate(e);
+        if (magneticActive(e) && !e.isAltDown() && !e.isControlDown() && acceptMagnetic(e)) {
+            dragging = false;
+            dragImagery = null;
+            frame.mapView.repaint();
+            return;
+        }
         if (e.isAltDown() && followEnabled) {
             if (hovered == null || hovered.way == null) return;
             if (followStart == null || followStart.way != hovered.way) {
@@ -276,7 +282,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         if (magneticTimer != null) magneticTimer.stop();
         if (magneticActive(e) && !e.isControlDown()) {
             dragImagery = captureDragImagery();
-            if (!acceptMagnetic(e)) appendMagneticAt(e);
+            appendMagneticAt(e);
         } else {
             appendAt(e);
         }
