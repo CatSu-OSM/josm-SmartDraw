@@ -116,6 +116,24 @@ public final class MagneticTracer {
         PriorityQueue<Step> queue = new PriorityQueue<>((a, b) -> Double.compare(a.cost, b.cost));
         double chordX = goal.x - start.x, chordY = goal.y - start.y;
         double chordLengthSquared = chordX * chordX + chordY * chordY;
+        double chordLength = Math.sqrt(chordLengthSquared);
+        double normalX = chordLength == 0 ? 0 : -chordY / chordLength;
+        double normalY = chordLength == 0 ? 0 : chordX / chordLength;
+        int reference = source;
+        if (edge[reference] < 0.035) {
+            for (int y = Math.max(1, start.y - 3); y <= Math.min(height - 2, start.y + 3); y++)
+                for (int x = Math.max(1, start.x - 3); x <= Math.min(width - 2, start.x + 3); x++) {
+                    int candidate = y * width + x;
+                    if (edge[candidate] > edge[reference]) reference = candidate;
+                }
+        }
+        boolean referenceInside = reference % width > 0 && reference % width < width - 1
+                && reference / width > 0 && reference / width < height - 1;
+        double[] initialSide = referenceInside
+                ? projectedGradient(softRed, softGreen, softBlue, reference, width, normalX, normalY)
+                : new double[3];
+        double initialMagnitude = magnitude(initialSide);
+        boolean sideKnown = edge[reference] >= 0.035 && initialMagnitude >= 2;
         double attractionSquared = (double) attraction * attraction;
         distance[source] = 0;
         queue.add(new Step(source, 0));
@@ -131,6 +149,14 @@ public final class MagneticTracer {
                 if (nx < 1 || nx >= width - 1 || ny < 1 || ny >= height - 1) continue;
                 int next = ny * width + nx;
                 if (!valid[next]) continue;
+                if (sideKnown && edge[next] >= 0.035) {
+                    double sideRed = projectedGradient(softRed, next, width, normalX, normalY);
+                    double sideGreen = projectedGradient(softGreen, next, width, normalX, normalY);
+                    double sideBlue = projectedGradient(softBlue, next, width, normalX, normalY);
+                    double sideSquared = sideRed * sideRed + sideGreen * sideGreen + sideBlue * sideBlue;
+                    if (sideSquared >= 4 && initialSide[0] * sideRed + initialSide[1] * sideGreen
+                            + initialSide[2] * sideBlue < -0.35 * initialMagnitude * Math.sqrt(sideSquared)) continue;
+                }
                 double fraction = chordLengthSquared == 0 ? 0 : Math.max(0, Math.min(1,
                         ((nx - start.x) * chordX + (ny - start.y) * chordY) / chordLengthSquared));
                 double offsetX = nx - start.x - fraction * chordX;
@@ -165,6 +191,29 @@ public final class MagneticTracer {
         }
         if (strongPixels * 2 < path.size()) return List.of();
         return path;
+    }
+
+    private static double[] projectedGradient(double[] red, double[] green, double[] blue,
+            int index, int width, double normalX, double normalY) {
+        return new double[] {
+            projectedGradient(red, index, width, normalX, normalY),
+            projectedGradient(green, index, width, normalX, normalY),
+            projectedGradient(blue, index, width, normalX, normalY)
+        };
+    }
+
+    private static double projectedGradient(double[] channel, int index, int width,
+            double normalX, double normalY) {
+        return (channel[index + 1] - channel[index - 1]) * normalX
+                + (channel[index + width] - channel[index - width]) * normalY;
+    }
+
+    private static double magnitude(double[] vector) {
+        return Math.sqrt(dot(vector, vector));
+    }
+
+    private static double dot(double[] a, double[] b) {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     }
 
     private static final class Step {

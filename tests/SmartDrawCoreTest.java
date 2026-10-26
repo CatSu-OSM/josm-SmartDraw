@@ -203,6 +203,14 @@ public final class SmartDrawCoreTest {
                 12, 12, () -> false).isEmpty(), "narrow straight corridor cannot follow a curved edge");
         check(!MagneticTracer.trace(curved, new Point(44, 10), new Point(44, 110),
                 12, 35, () -> false).isEmpty(), "wider corridor follows a long curved edge");
+        BufferedImage roadSides = new BufferedImage(80, 96, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < 96; y++) for (int x = 0; x < 80; x++) {
+            roadSides.setRGB(x, y, x < 32 ? 0xff303030 : x < 42 ? 0xffb0b0b0 : 0xff101010);
+        }
+        check(!MagneticTracer.trace(roadSides, new Point(31, 4), new Point(31, 90),
+                12, 25, () -> false).isEmpty(), "trace stays usable on the original road edge");
+        check(MagneticTracer.trace(roadSides, new Point(31, 4), new Point(41, 90),
+                12, 25, () -> false).isEmpty(), "trace cannot switch to the opposite road edge");
         BufferedImage roof = new BufferedImage(160, 160, BufferedImage.TYPE_INT_ARGB);
         for (int y = 0; y < 160; y++) for (int x = 0; x < 160; x++) {
             roof.setRGB(x, y, x >= 45 && x <= 95 && y >= 55 && y <= 85

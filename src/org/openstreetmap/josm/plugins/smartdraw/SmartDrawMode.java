@@ -433,7 +433,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             return;
         }
         MapView view = frame.mapView;
-        int dragRadius = Math.max(32, magneticRadius);
+        int dragRadius = magneticRadius;
         Point snapped = MagneticTracer.snap(dragImagery, e.getPoint(), dragRadius);
         if (snapped == null) {
             setMagneticStatus("No detectable imagery edge within " + dragRadius + " px of the cursor");
@@ -450,7 +450,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             setMagneticStatus("Move closer to the last traced point; gap was not connected");
             return;
         }
-        int traceRadius = magneticTraceRadius(anchor.distance(snapped), dragRadius);
+        int traceRadius = dragRadius;
         int margin = Math.max(8, traceRadius + 3);
         Rectangle area = new Rectangle(Math.min(anchor.x, snapped.x) - margin,
                 Math.min(anchor.y, snapped.y) - margin,
@@ -463,7 +463,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             path = MagneticTracer.trace(dragImagery.getSubimage(area.x, area.y, area.width, area.height),
                     new Point(anchor.x - area.x, anchor.y - area.y),
                     new Point(snapped.x - area.x, snapped.y - area.y),
-                    Math.max(magneticSensitivity, 12), traceRadius, () -> false);
+                    magneticSensitivity, traceRadius, () -> false);
         }
         if (path.size() > 1) {
             List<Point2D> pixels = new ArrayList<>();
