@@ -28,7 +28,8 @@ public final class MagneticTracer {
                     || !opaque(image.getRGB(x, y - 1)) || !opaque(image.getRGB(x, y + 1))) continue;
             double strength = colorEdge(image, x, y);
             if (strength < 0.035) continue;
-            double score = strength / (1 + distance / 8);
+            double proximity = 1 + distance / 4;
+            double score = strength / (proximity * proximity);
             if (score > bestScore) { bestScore = score; best = new Point(x, y); }
         }
         return best;
@@ -58,6 +59,17 @@ public final class MagneticTracer {
             energy += gx * gx + gy * gy;
         }
         return Math.sqrt(energy / 3) / 255;
+    }
+
+    /** Traces to an edge near the cursor, only when the existing anchor is already on an edge. */
+    public static List<Point> traceToEdge(BufferedImage image, Point start, Point cursor,
+            double sensitivity, int snapRadius, int corridorRadius, BooleanSupplier cancelled) {
+        if (image == null || start == null || cursor == null) return List.of();
+        Point startEdge = snap(image, start, 5);
+        if (startEdge == null) return List.of();
+        Point goalEdge = snap(image, cursor, snapRadius);
+        if (goalEdge == null) return List.of();
+        return trace(image, start, goalEdge, sensitivity, corridorRadius, cancelled);
     }
 
     public static List<Point> trace(BufferedImage image, Point start, Point goal,
@@ -149,13 +161,16 @@ public final class MagneticTracer {
                 if (nx < 1 || nx >= width - 1 || ny < 1 || ny >= height - 1) continue;
                 int next = ny * width + nx;
                 if (!valid[next]) continue;
+                double sidePenalty = 0;
                 if (sideKnown && edge[next] >= 0.035) {
                     double sideRed = projectedGradient(softRed, next, width, normalX, normalY);
                     double sideGreen = projectedGradient(softGreen, next, width, normalX, normalY);
                     double sideBlue = projectedGradient(softBlue, next, width, normalX, normalY);
                     double sideSquared = sideRed * sideRed + sideGreen * sideGreen + sideBlue * sideBlue;
                     if (sideSquared >= 4 && initialSide[0] * sideRed + initialSide[1] * sideGreen
-                            + initialSide[2] * sideBlue < -0.35 * initialMagnitude * Math.sqrt(sideSquared)) continue;
+                            + initialSide[2] * sideBlue < -0.8 * initialMagnitude * Math.sqrt(sideSquared)) {
+                        sidePenalty = Math.max(2, sensitivity * 3);
+                    }
                 }
                 double fraction = chordLengthSquared == 0 ? 0 : Math.max(0, Math.min(1,
                         ((nx - start.x) * chordX + (ny - start.y) * chordY) / chordLengthSquared));
@@ -166,7 +181,8 @@ public final class MagneticTracer {
                 double corridorDistance = Math.sqrt(corridorSquared);
                 double strength = Math.min(1, edge[next] / 0.15);
                 double cost = (dx == 0 || dy == 0 ? 1 : 1.4142)
-                        * (1 + Math.max(0, sensitivity) * (1 - strength) + 0.015 * corridorDistance);
+                        * (1 + Math.max(0, sensitivity) * (1 - strength) + 0.015 * corridorDistance
+                                + sidePenalty);
                 double proposal = current.cost + cost;
                 if (proposal < distance[next]) {
                     distance[next] = proposal; previous[next] = current.index;
@@ -180,17 +196,43 @@ public final class MagneticTracer {
         Collections.reverse(path);
         int weakRun = 0;
         int strongPixels = 0;
+        int oppositePixels = 0;
         double minimumEdge = 0.035;
         for (Point point : path) {
-            if (edge[point.y * width + point.x] >= minimumEdge) {
+            int index = point.y * width + point.x;
+            if (edge[index] >= minimumEdge) {
                 weakRun = 0;
                 strongPixels++;
+                if (sideKnown && point.x > 0 && point.x < width - 1
+                        && point.y > 0 && point.y < height - 1) {
+                    double[] side = projectedGradient(softRed, softGreen, softBlue,
+                            index, width, normalX, normalY);
+                    double sideMagnitude = magnitude(side);
+                    if (sideMagnitude >= 2 && dot(initialSide, side)
+                            < -0.8 * initialMagnitude * sideMagnitude) oppositePixels++;
+                }
             } else if (++weakRun > 12) {
                 return List.of();
             }
         }
         if (strongPixels * 2 < path.size()) return List.of();
+        if (sideKnown) {
+            if (oppositePixels > Math.max(4, strongPixels / 3)) return List.of();
+            int lastIndex = goal.y * width + goal.x;
+            if (goal.x > 0 && goal.x < width - 1 && goal.y > 0 && goal.y < height - 1
+                    && edge[lastIndex] >= minimumEdge
+                    && isOpposite(softRed, softGreen, softBlue, lastIndex, width,
+                            normalX, normalY, initialSide, initialMagnitude)) return List.of();
+        }
         return path;
+    }
+
+    private static boolean isOpposite(double[] red, double[] green, double[] blue,
+            int index, int width, double normalX, double normalY,
+            double[] initialSide, double initialMagnitude) {
+        double[] side = projectedGradient(red, green, blue, index, width, normalX, normalY);
+        double magnitude = magnitude(side);
+        return magnitude >= 2 && dot(initialSide, side) < -0.8 * initialMagnitude * magnitude;
     }
 
     private static double[] projectedGradient(double[] red, double[] green, double[] blue,

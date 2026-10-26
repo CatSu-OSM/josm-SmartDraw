@@ -167,6 +167,20 @@ public final class SmartDrawCoreTest {
         Point snapped = MagneticTracer.snap(image, new Point(12, 16), 6);
         check(snapped != null && Math.abs(snapped.x - 15) <= 1 && snapped.y == 16,
                 "drag pointer snaps to nearby image edge");
+        List<Point> edgeEnded = MagneticTracer.traceToEdge(image, new Point(15, 3),
+                new Point(19, 28), 8, 5, 5, () -> false);
+        check(!edgeEnded.isEmpty() && Math.abs(edgeEnded.get(edgeEnded.size() - 1).x - 15) <= 1,
+                "magnetic preview ends on the edge instead of the off-edge cursor");
+        check(MagneticTracer.traceToEdge(image, new Point(5, 3), new Point(19, 28),
+                8, 5, 20, () -> false).isEmpty(),
+                "magnetic preview rejects a long hook from an off-edge anchor");
+        BufferedImage competingEdges = new BufferedImage(48, 32, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 48; x++) {
+            competingEdges.setRGB(x, y, x < 16 ? 0xff000000 : x < 24 ? 0xff505050 : 0xffffffff);
+        }
+        Point preferredEdge = MagneticTracer.snap(competingEdges, new Point(15, 16), 12);
+        check(preferredEdge != null && preferredEdge.x <= 17,
+                "a nearby detectable boundary wins over a stronger distant edge");
         BufferedImage hueEdge = new BufferedImage(64, 48, BufferedImage.TYPE_INT_ARGB);
         for (int y = 0; y < 48; y++) for (int x = 0; x < 64; x++) {
             hueEdge.setRGB(x, y, x < 32 ? 0xffc80000 : 0xff003b00);
@@ -211,6 +225,14 @@ public final class SmartDrawCoreTest {
                 12, 25, () -> false).isEmpty(), "trace stays usable on the original road edge");
         check(MagneticTracer.trace(roadSides, new Point(31, 4), new Point(41, 90),
                 12, 25, () -> false).isEmpty(), "trace cannot switch to the opposite road edge");
+        BufferedImage unevenEdge = new BufferedImage(32, 64, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < 64; y++) for (int x = 0; x < 32; x++) {
+            boolean reversedPatch = y >= 24 && y < 32;
+            unevenEdge.setRGB(x, y, (x < 16) != reversedPatch ? 0xff202020 : 0xffdddddd);
+        }
+        check(!MagneticTracer.trace(unevenEdge, new Point(15, 4), new Point(15, 59),
+                12, 5, () -> false).isEmpty(),
+                "a short color reversal does not disable tracing on the same boundary");
         BufferedImage roof = new BufferedImage(160, 160, BufferedImage.TYPE_INT_ARGB);
         for (int y = 0; y < 160; y++) for (int x = 0; x < 160; x++) {
             roof.setRGB(x, y, x >= 45 && x <= 95 && y >= 55 && y <= 85

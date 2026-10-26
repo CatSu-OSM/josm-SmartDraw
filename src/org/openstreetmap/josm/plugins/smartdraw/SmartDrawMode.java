@@ -94,6 +94,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private Candidate hovered;
     private Candidate followStart;
     private Point cursor;
+    private Point magneticPreviewCursor;
     private Point pendingBuildingPress;
     private boolean dragging;
     private boolean close;
@@ -101,7 +102,6 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private boolean smartSnap = true;
     private boolean followEnabled = true;
     private boolean magneticEnabled;
-    private boolean shiftHeld;
     private boolean overlapWarning = true;
     private boolean forward = true;
     private int snapPixels = 14;
@@ -126,8 +126,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         this.frame = frame;
         shiftListener = event -> {
             if (event.getKeyCode() == KeyEvent.VK_SHIFT) {
-                shiftHeld = event.getID() == KeyEvent.KEY_PRESSED;
-                if (!shiftHeld && !magneticEnabled && !previewReady) {
+                if (event.getID() == KeyEvent.KEY_RELEASED && !magneticEnabled && !previewReady) {
                     magneticEpoch.incrementAndGet();
                     magneticPreview.clear();
                     if (magneticTimer != null) magneticTimer.stop();
@@ -172,7 +171,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         view.addTemporaryLayer(this);
         frame.addTopPanel(controls);
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(shiftListener);
-        setMagneticStatus(idleStatus());
+        setMagneticStatus(idleStatus() + (magneticEnabled ? " | Magnetic ON" : " | Magnetic OFF"));
         magneticWorker = Executors.newSingleThreadExecutor(r -> {
             Thread thread = new Thread(r, "SmartDraw magnetic tracer");
             thread.setDaemon(true);
@@ -324,7 +323,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         frame.mapView.repaint();
     }
 
-    private boolean magneticActive(MouseEvent e) { return magneticEnabled || shiftHeld || e.isShiftDown(); }
+    private boolean magneticActive(MouseEvent e) { return magneticEnabled || e.isShiftDown(); }
 
     private void setMagneticStatus(String message) { controls.status.setText(message); }
 
@@ -335,12 +334,15 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         if (!enabled) {
             magneticEpoch.incrementAndGet();
             magneticPreview.clear();
+            magneticPreviewCursor = null;
             dragImagery = null;
             if (magneticTimer != null) magneticTimer.stop();
         }
         if (previewReady) showSimplificationStatus();
-        else setMagneticStatus(enabled ? "Magnetic on: move along the imagery edge"
-                : "Magnetic off: press M or hold Shift to trace imagery");
+        else if (enabled && cursor != null && !dragging && !draft.isEmpty()) {
+            requestMagnetic(cursor, true);
+        } else setMagneticStatus(enabled ? "Magnetic ON: drag or hover along an imagery edge"
+                : "Magnetic OFF: freehand drawing (hold Shift for temporary tracing)");
         frame.mapView.repaint();
         frame.mapView.requestFocusInWindow();
     }
@@ -445,6 +447,10 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             return;
         }
         Point anchor = view.getPoint(draft.get(draft.size() - 1).location());
+        if (MagneticTracer.snap(dragImagery, anchor, 5) == null) {
+            setMagneticStatus("Last point is off the imagery edge; Backspace and place it on the boundary");
+            return;
+        }
         if (anchor.distance(snapped) < Math.max(densityPixels, 10)) return;
         if (anchor.distance(snapped) > magneticSpanLimit(view)) {
             setMagneticStatus("Move closer to the last traced point; gap was not connected");
@@ -487,21 +493,30 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     }
 
     private void requestMagnetic(MouseEvent e) {
+        requestMagnetic(e.getPoint(), magneticActive(e));
+    }
+
+    private void requestMagnetic(Point target, boolean active) {
         magneticPreview.clear();
+        magneticPreviewCursor = null;
         magneticEpoch.incrementAndGet();
         if (magneticTimer == null) return;
         magneticTimer.stop();
         if (draft.isEmpty()) {
-            setMagneticStatus(idleStatus());
+            setMagneticStatus(idleStatus() + (active ? " | Magnetic ON" : " | Magnetic OFF"));
             frame.mapView.repaint(); return;
         }
-        if (followStart != null || !magneticActive(e)) {
-            setMagneticStatus("Hold Shift or enable Magnetic");
+        if (followStart != null) {
+            setMagneticStatus("Finish following the existing way before tracing imagery");
+            frame.mapView.repaint(); return;
+        }
+        if (!active) {
+            setMagneticStatus("Magnetic OFF: press M or hold Shift to trace imagery");
             frame.mapView.repaint(); return;
         }
         Point anchor = frame.mapView.getPoint(draft.get(draft.size() - 1).location());
-        if (anchor.distance(e.getPoint()) < densityPixels) { setMagneticStatus("Move away from the anchor"); return; }
-        if (anchor.distance(e.getPoint()) > magneticSpanLimit(frame.mapView)) {
+        if (anchor.distance(target) < densityPixels) { setMagneticStatus("Move away from the anchor"); return; }
+        if (anchor.distance(target) > magneticSpanLimit(frame.mapView)) {
             setMagneticStatus("Move closer to the anchor (under half the map width)"); return;
         }
         setMagneticStatus("Analyzing imagery...");
@@ -531,22 +546,33 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         if (image == null) { setMagneticStatus("Imagery preview unavailable"); return; }
         Point localAnchor = new Point(anchor.x - area.x, anchor.y - area.y);
         Point localGoal = new Point(goal.x - area.x, goal.y - area.y);
+        if (MagneticTracer.snap(image, localAnchor, 5) == null) {
+            setMagneticStatus("Last point is off the imagery edge; Backspace and place it on the boundary");
+            return;
+        }
+        if (MagneticTracer.snap(image, localGoal, magneticRadius) == null) {
+            setMagneticStatus("No imagery edge near the cursor; move back to the boundary");
+            return;
+        }
         Rectangle crop = area;
         magneticWorker.submit(() -> {
-            List<Point> path = MagneticTracer.trace(image, localAnchor, localGoal,
-                    magneticSensitivity, traceRadius, () -> magneticEpoch.get() != epoch || Thread.currentThread().isInterrupted());
+            List<Point> path = MagneticTracer.traceToEdge(image, localAnchor, localGoal,
+                    magneticSensitivity, magneticRadius, traceRadius,
+                    () -> magneticEpoch.get() != epoch || Thread.currentThread().isInterrupted());
             SwingUtilities.invokeLater(() -> {
                 if (magneticEpoch.get() != epoch) return;
                 magneticPreview.clear();
+                magneticPreviewCursor = null;
                 if (path.size() > 1) {
                     List<Point2D> pixels = new ArrayList<>();
                     for (Point p : path) pixels.add(new Point2D.Double(p.x + crop.x, p.y + crop.y));
                     for (Point2D p : Geometry.simplify(pixels, 1.5)) {
                         magneticPreview.add(new TracePoint(view.getLatLon(p.getX(), p.getY()), MAGNETIC, false));
                     }
+                    magneticPreviewCursor = goal;
                 }
                 setMagneticStatus(magneticPreview.size() > 1 ? "Orange path ready: click to accept"
-                        : "No usable edge here; move the cursor or click to draw manually");
+                        : "No continuous edge from the last point to the cursor; move closer to the boundary");
                 view.repaint();
             });
         });
@@ -555,10 +581,12 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private boolean acceptMagnetic(MouseEvent e) {
         if (magneticPreview.size() < 2 || draft.isEmpty()) return false;
         MapView view = frame.mapView;
-        if (view.getPoint2D(magneticPreview.get(magneticPreview.size() - 1).location()).distance(e.getPoint()) > 8) return false;
+        if ((magneticPreviewCursor == null || magneticPreviewCursor.distance(e.getPoint()) > 8)
+                && view.getPoint2D(magneticPreview.get(magneticPreview.size() - 1).location()).distance(e.getPoint()) > 8) return false;
         if (view.getPoint2D(magneticPreview.get(0).location()).distance(view.getPoint2D(draft.get(draft.size() - 1).location())) > 4) return false;
         for (int i = 1; i < magneticPreview.size(); i++) add(magneticPreview.get(i));
         magneticPreview.clear();
+        magneticPreviewCursor = null;
         magneticEpoch.incrementAndGet();
         setMagneticStatus("Magnetic path added");
         return true;
@@ -1150,7 +1178,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
 
     private final class SmartDrawControls extends JPanel {
         final JLabel status = new JLabel();
-        final JCheckBox magnetic = new JCheckBox("Magnetic");
+        final JCheckBox magnetic = new JCheckBox("Magnetic imagery (M)");
         final JComboBox<DrawKind> kind = new JComboBox<>(DrawKind.values());
         SmartDrawControls() {
             super(new FlowLayout(FlowLayout.LEFT, 8, 2));
