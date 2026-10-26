@@ -83,6 +83,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private List<TracePoint> simplificationPreview = List.of();
     private List<TracePoint> displayedPreview = List.of();
     private final Map<Way, List<Candidate>> pending = new HashMap<>();
+    private final Map<KeyStroke, Object> previousKeyBindings = new HashMap<>();
     private final AtomicInteger magneticEpoch = new AtomicInteger();
     private DrawKind kind = DrawKind.WAY;
     private final SmartDrawControls controls = new SmartDrawControls();
@@ -110,6 +111,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private double epsilonMultiplier = 1.1;
     private double maxPointsPerKm = 150;
     private int densityWindow = 10;
+    private int confirmDiscardNodes = 10;
+    private double confirmDiscardMeters = 100;
     private boolean autoSimplify = true;
     private boolean previewReady;
     private double magneticSensitivity = 12;
@@ -152,6 +155,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         maxPointsPerKm = Math.max(1, pref.getDouble("smartdraw.maxPointsPerKm", 150));
         densityWindow = Math.max(2, pref.getInt("smartdraw.densityWindow", 10));
         autoSimplify = pref.getBoolean("smartdraw.autoSimplify", true);
+        confirmDiscardNodes = Math.max(1, pref.getInt("smartdraw.confirmDiscardNodes", 10));
+        confirmDiscardMeters = Math.max(1, pref.getDouble("smartdraw.confirmDiscardMeters", 100));
         rules.configure(pref.get("smartdraw.includes", rules.includes()),
                 pref.get("smartdraw.excludes", rules.excludes()),
                 pref.getBoolean("smartdraw.unrestricted", false));
@@ -176,11 +181,12 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         magneticTimer = new Timer(100, event -> calculateMagnetic());
         magneticTimer.setRepeats(false);
         bind(view, "ENTER", "smartdraw.finish", this::enterOrFinish);
-        bind(view, "ESCAPE", "smartdraw.cancel", this::cancel);
+        bind(view, "ESCAPE", "smartdraw.cancel", this::confirmCancel);
         bind(view, "BACK_SPACE", "smartdraw.back", this::back);
         bind(view, "UP", "smartdraw.more-detail", () -> adjustSimplification(false));
         bind(view, "DOWN", "smartdraw.less-detail", () -> adjustSimplification(true));
         bind(view, "Q", "smartdraw.options", this::options);
+        bind(view, "M", "smartdraw.magnetic", () -> setMagneticEnabled(!magneticEnabled));
         bind(view, reverseShortcut.getKeyStroke(), "smartdraw.reverse", () -> { forward = !forward; refreshFollow(); });
     }
 
@@ -189,6 +195,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     }
 
     private void bind(MapView view, KeyStroke key, String action, Runnable runnable) {
+        previousKeyBindings.putIfAbsent(key, view.getInputMap(JComponent.WHEN_FOCUSED).get(key));
         view.getInputMap(JComponent.WHEN_FOCUSED).put(key, action);
         view.getActionMap().put(action, new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent e) { runnable.run(); }
@@ -205,8 +212,13 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         view.removeMouseListener(this);
         view.removeMouseMotionListener(this);
         view.removeTemporaryLayer(this);
+        for (Map.Entry<KeyStroke, Object> entry : previousKeyBindings.entrySet()) {
+            if (entry.getValue() == null) view.getInputMap(JComponent.WHEN_FOCUSED).remove(entry.getKey());
+            else view.getInputMap(JComponent.WHEN_FOCUSED).put(entry.getKey(), entry.getValue());
+        }
+        previousKeyBindings.clear();
         for (String action : new String[] {"finish", "cancel", "back", "reverse",
-                "more-detail", "less-detail", "options"}) {
+                "more-detail", "less-detail", "options", "magnetic"}) {
             view.getActionMap().remove("smartdraw." + action);
         }
         super.exitMode();
@@ -214,7 +226,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
 
     @Override public String getModeHelpText() {
         return "Drag/click: draw | Building: double-click roof | Alt-click: follow | " + reverseShortcut.getKeyText()
-                + ": reverse | Enter: simplify/save | Up/Down: detail | Q: options | Backspace: edit";
+                + ": reverse | Enter: simplify/save | Up/Down: detail | M: magnetic | Q: options | Backspace: edit";
     }
 
     @Override public void mousePressed(MouseEvent e) {
@@ -309,6 +321,23 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
     private boolean magneticActive(MouseEvent e) { return magneticEnabled || shiftHeld || e.isShiftDown(); }
 
     private void setMagneticStatus(String message) { controls.status.setText(message); }
+
+    private void setMagneticEnabled(boolean enabled) {
+        magneticEnabled = enabled;
+        controls.magnetic.setSelected(enabled);
+        Config.getPref().putBoolean("smartdraw.magnetic", enabled);
+        if (!enabled) {
+            magneticEpoch.incrementAndGet();
+            magneticPreview.clear();
+            dragImagery = null;
+            if (magneticTimer != null) magneticTimer.stop();
+        }
+        if (previewReady) showSimplificationStatus();
+        else setMagneticStatus(enabled ? "Magnetic on: move along the imagery edge"
+                : "Magnetic off: press M or hold Shift to trace imagery");
+        frame.mapView.repaint();
+        frame.mapView.requestFocusInWindow();
+    }
 
     private String idleStatus() {
         if (kind == DrawKind.BUILDING) return "Double-click a roof to propose a building outline";
@@ -672,6 +701,23 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         frame.mapView.repaint();
     }
 
+    private void confirmCancel() {
+        List<LatLon> points = new ArrayList<>(draft.size());
+        for (TracePoint point : draft) points.add(point.location());
+        if (!DraftDiscardPolicy.needsConfirmation(points, confirmDiscardNodes, confirmDiscardMeters)) {
+            cancel();
+            return;
+        }
+        Object[] choices = {"Keep drawing", "Discard draft"};
+        int choice = JOptionPane.showOptionDialog(frame,
+                String.format(Locale.ROOT, "Discard this unsaved draft? It has %d nodes and is about %.0f m long.",
+                        points.size(), DraftDiscardPolicy.lengthMeters(points)),
+                "Discard SmartDraw draft?", JOptionPane.DEFAULT_OPTION, JOptionPane.WARNING_MESSAGE,
+                null, choices, choices[0]);
+        if (choice == 1) cancel();
+        else frame.mapView.requestFocusInWindow();
+    }
+
     private void invalidateSimplificationPreview() {
         previewReady = false;
         simplificationPreview = List.of();
@@ -1025,6 +1071,8 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         JSpinner multiplier = new JSpinner(new SpinnerNumberModel(epsilonMultiplier, 1.01, 3.0, 0.01));
         JSpinner maxPkm = new JSpinner(new SpinnerNumberModel(maxPointsPerKm, 1.0, 5000.0, 10.0));
         JSpinner pkmWindow = new JSpinner(new SpinnerNumberModel(densityWindow, 2, 100, 1));
+        JSpinner discardNodes = new JSpinner(new SpinnerNumberModel(confirmDiscardNodes, 1, 10000, 1));
+        JSpinner discardMeters = new JSpinner(new SpinnerNumberModel(confirmDiscardMeters, 1.0, 100000.0, 10.0));
         JSpinner sensitivity = new JSpinner(new SpinnerNumberModel(magneticSensitivity, 0.0, 20.0, 0.5));
         JSpinner radius = new JSpinner(new SpinnerNumberModel(magneticRadius, 4, 40, 1));
         JPanel panel = new JPanel(new GridLayout(0, 1));
@@ -1038,23 +1086,26 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
         panel.add(new JLabel("Up/Down epsilon multiplier")); panel.add(multiplier);
         panel.add(new JLabel("Maximum points per km")); panel.add(maxPkm);
         panel.add(new JLabel("Points-per-km window (segments)")); panel.add(pkmWindow);
+        panel.add(new JLabel("Confirm Esc above this node count")); panel.add(discardNodes);
+        panel.add(new JLabel("Confirm Esc above this length (metres)")); panel.add(discardMeters);
         panel.add(new JLabel("Included tags, comma separated")); panel.add(includes);
         panel.add(new JLabel("Excluded tags, comma separated")); panel.add(excludes);
         if (JOptionPane.showConfirmDialog(frame, panel, "SmartDraw options", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
             smartSnap = snapping.isSelected(); followEnabled = following.isSelected(); overlapWarning = overlaps.isSelected();
-            magneticEnabled = magnetic.isSelected(); magneticSensitivity = (Double) sensitivity.getValue(); magneticRadius = (Integer) radius.getValue();
+            magneticSensitivity = (Double) sensitivity.getValue(); magneticRadius = (Integer) radius.getValue();
             rules.configure(includes.getText(), excludes.getText(), unrestricted.isSelected());
             snapPixels = (Integer) snap.getValue(); densityPixels = (Integer) density.getValue();
             simplifyPixels = (Double) simplify.getValue();
             epsilonMultiplier = (Double) multiplier.getValue();
             maxPointsPerKm = (Double) maxPkm.getValue();
             densityWindow = (Integer) pkmWindow.getValue();
+            confirmDiscardNodes = (Integer) discardNodes.getValue();
+            confirmDiscardMeters = (Double) discardMeters.getValue();
             autoSimplify = autosimplify.isSelected();
             var pref = Config.getPref();
             pref.putBoolean("smartdraw.snap", smartSnap);
             pref.putBoolean("smartdraw.follow", followEnabled);
             pref.putBoolean("smartdraw.overlapWarning", overlapWarning);
-            pref.putBoolean("smartdraw.magnetic", magneticEnabled);
             pref.putDouble("smartdraw.magneticSensitivity", magneticSensitivity);
             pref.putInt("smartdraw.magneticRadius", magneticRadius);
             pref.putBoolean("smartdraw.unrestricted", rules.unrestricted());
@@ -1065,9 +1116,11 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             pref.putDouble("smartdraw.maxPointsPerKm", maxPointsPerKm);
             pref.putInt("smartdraw.densityWindow", densityWindow);
             pref.putBoolean("smartdraw.autoSimplify", autoSimplify);
+            pref.putInt("smartdraw.confirmDiscardNodes", confirmDiscardNodes);
+            pref.putDouble("smartdraw.confirmDiscardMeters", confirmDiscardMeters);
             pref.put("smartdraw.includes", rules.includes());
             pref.put("smartdraw.excludes", rules.excludes());
-            controls.magnetic.setSelected(magneticEnabled);
+            setMagneticEnabled(magnetic.isSelected());
             if (previewReady) prepareSimplificationPreview();
             frame.mapView.requestFocusInWindow();
         }
@@ -1114,12 +1167,7 @@ public final class SmartDrawMode extends MapMode implements MapViewPaintable {
             });
             add(kind);
             magnetic.addActionListener(event -> {
-                magneticEnabled = magnetic.isSelected();
-                Config.getPref().putBoolean("smartdraw.magnetic", magneticEnabled);
-                setMagneticStatus(SmartDrawMode.this.kind == DrawKind.BUILDING ? idleStatus()
-                        : magneticEnabled ? "Click an anchor, then move the cursor"
-                        : "Hold Shift or enable Magnetic");
-                frame.mapView.requestFocusInWindow();
+                setMagneticEnabled(magnetic.isSelected());
             });
             add(magnetic);
             JButton optionsButton = new JButton("Options...");

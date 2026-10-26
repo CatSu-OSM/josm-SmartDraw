@@ -16,6 +16,7 @@ import org.openstreetmap.josm.data.osm.Way;
 import org.openstreetmap.josm.plugins.smartdraw.FollowPath;
 import org.openstreetmap.josm.plugins.smartdraw.BuildingDetector;
 import org.openstreetmap.josm.plugins.smartdraw.BuildingGeometry;
+import org.openstreetmap.josm.plugins.smartdraw.DraftDiscardPolicy;
 import org.openstreetmap.josm.plugins.smartdraw.FastDrawSimplifier;
 import org.openstreetmap.josm.plugins.smartdraw.Geometry;
 import org.openstreetmap.josm.plugins.smartdraw.MagneticTracer;
@@ -74,6 +75,16 @@ public final class SmartDrawCoreTest {
         check(SimplificationStats.maxPointsPerKm(List.of(new LatLon(0, 0),
                 new LatLon(0, 0.001), new LatLon(0, 0.00101), new LatLon(0, 0.00102)), 2) > 800,
                 "sliding density window detects a locally dense segment");
+        List<LatLon> shortDraft = List.of(new LatLon(0, 0), new LatLon(0, 0.0005));
+        List<LatLon> longDraft = List.of(new LatLon(0, 0), new LatLon(0, 0.0011));
+        check(!DraftDiscardPolicy.needsConfirmation(shortDraft, 10, 100),
+                "short drafts cancel without confirmation");
+        check(DraftDiscardPolicy.needsConfirmation(longDraft, 10, 100),
+                "drafts longer than 100 metres require confirmation");
+        check(!DraftDiscardPolicy.needsConfirmation(java.util.Collections.nCopies(10, new LatLon(0, 0)), 10, 100),
+                "exactly ten nodes do not require confirmation by count");
+        check(DraftDiscardPolicy.needsConfirmation(java.util.Collections.nCopies(11, new LatLon(0, 0)), 10, 100),
+                "drafts with more than ten nodes require confirmation");
         List<Point2D> noisy = List.of(new Point2D.Double(0, 0), new Point2D.Double(1, 3),
                 new Point2D.Double(2, -3), new Point2D.Double(3, 3),
                 new Point2D.Double(4, -3), new Point2D.Double(5, 0));
